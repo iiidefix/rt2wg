@@ -1,0 +1,94 @@
+#!/bin/sh
+# Builds an OpenWrt apk package (OpenWrt 25.12 and later) for one target
+# architecture, without the OpenWrt SDK: cross-compile with Go, then pack
+# with apk-tools v3 "apk mkpkg".
+#
+# usage: deploy/openwrt/build-apk.sh [openwrt-arch]   (default x86_64)
+#
+# The OpenWrt arch is the router's package architecture: DISTRIB_ARCH in its
+# /etc/openwrt_release, e.g. x86_64, aarch64_cortex-a53, mipsel_24kc.
+# Set APK to an apk-tools v3 binary to skip downloading Alpine's apk.static.
+# The package lands in dist/.
+set -eu
+
+arch=${1:-x86_64}
+goarm=
+gomips=
+case "$arch" in
+	x86_64) goarch=amd64 ;;
+	aarch64_*) goarch=arm64 ;;
+	arm_arm1176*) goarch=arm goarm=6 ;;
+	arm_*) goarch=arm goarm=7 ;;
+	mipsel_*) goarch=mipsle gomips=softfloat ;;
+	mips_*) goarch=mips gomips=softfloat ;;
+	*) echo "unsupported OpenWrt arch: $arch" >&2; exit 2 ;;
+esac
+
+root=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$root"
+
+# A tag on HEAD (v1.2.3) is the version; otherwise the commit time.
+if tag=$(git describe --tags --exact-match 2>/dev/null); then
+	version=${tag#v}
+else
+	version=0.0.0_git$(git log -1 --format=%cd --date=format:%Y%m%d%H%M%S)
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+if [ -z "${APK:-}" ]; then
+	mirror=https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64
+	v=$(curl -fsS "$mirror/APKINDEX.tar.gz" | tar -xzO APKINDEX |
+		awk '/^P:apk-tools-static$/ { f = 1 } f && /^V:/ { print substr($0, 3); f = 0 }')
+	curl -fsS -o "$work/apk-static.apk" "$mirror/apk-tools-static-$v.apk"
+	tar -xzf "$work/apk-static.apk" -C "$work" sbin/apk.static 2>/dev/null
+	APK=$work/sbin/apk.static
+fi
+
+pkg=$work/pkg
+mkdir -p "$pkg/usr/bin" "$pkg/etc/init.d" "$pkg/etc/config"
+CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips \
+	go build -trimpath -ldflags='-s -w' -o "$pkg/usr/bin/rt2wg" ./cmd/rt2wg
+install -m 0755 deploy/openwrt/rt2wg.init "$pkg/etc/init.d/rt2wg"
+install -m 0644 deploy/openwrt/rt2wg.config "$pkg/etc/config/rt2wg"
+
+# Enable and start on install, as OpenWrt's own packages do; files under
+# /etc are kept by apk on upgrade, so local config edits survive.
+cat >"$work/post-install" <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/etc/init.d/rt2wg enable
+/etc/init.d/rt2wg start
+exit 0
+EOF
+cat >"$work/post-upgrade" <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/etc/init.d/rt2wg restart
+exit 0
+EOF
+cat >"$work/pre-deinstall" <<'EOF'
+#!/bin/sh
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+/etc/init.d/rt2wg stop
+/etc/init.d/rt2wg disable
+exit 0
+EOF
+
+mkdir -p dist
+out=dist/rt2wg-$version-r1_$arch.apk
+"$APK" mkpkg \
+	-I "name:rt2wg" \
+	-I "version:$version-r1" \
+	-I "description:Keeps WireGuard AllowedIPs in sync with the routing table" \
+	-I "arch:$arch" \
+	-I "license:GPL-3.0-or-later" \
+	-I "depends:kmod-wireguard" \
+	-I "build-time:$(date +%s)" \
+	-s "post-install:$work/post-install" \
+	-s "post-upgrade:$work/post-upgrade" \
+	-s "pre-deinstall:$work/pre-deinstall" \
+	-F "$pkg" \
+	-o "$out"
+echo "$out"

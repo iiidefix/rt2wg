@@ -1,0 +1,28 @@
+[Unit]
+Description=Sync WireGuard AllowedIPs with kernel routes on %i
+After=wg-quick@%i.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=WG_INTERFACE=%i
+# Optional overrides: WG_CONF_PATH, WG_ROUTE_TABLES, LOG_LEVEL
+EnvironmentFile=-/etc/default/rt2wg-%i
+ExecStart=/usr/local/bin/rt2wg
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Runs as root (to read the root-owned 0600 config) but with no capability
+# other than CAP_NET_ADMIN.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+ReadOnlyPaths=/etc/wireguard
+
+[Install]
+WantedBy=multi-user.target
