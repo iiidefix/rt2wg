@@ -3,10 +3,12 @@
 # architecture, without the OpenWrt SDK: cross-compile with Go, then pack
 # with apk-tools v3 "apk mkpkg".
 #
-# usage: deploy/openwrt/build-apk.sh [openwrt-arch]   (default x86_64)
+# usage: deploy/openwrt/build-apk.sh [arch]   (default x86_64)
 #
-# The OpenWrt arch is the router's package architecture: DISTRIB_ARCH in its
-# /etc/openwrt_release, e.g. x86_64, aarch64_cortex-a53, mipsel_24kc.
+# arch is the router's package architecture, OpenWrt's own name: the contents
+# of /etc/apk/arch or DISTRIB_ARCH in /etc/openwrt_release on the router
+# (x86_64, aarch64_cortex-a53, arm_cortex-a7_neon-vfpv4, mipsel_24kc, ...).
+# "apk --print-arch" prints a different name that apk will not install.
 # Set APK to an apk-tools v3 binary to skip downloading Alpine's apk.static.
 # The package lands in dist/.
 set -eu
@@ -14,13 +16,18 @@ set -eu
 arch=${1:-x86_64}
 goarm=
 gomips=
+go386=
 case "$arch" in
 	x86_64) goarch=amd64 ;;
+	i386_*) goarch=386 go386=softfloat ;;
 	aarch64_*) goarch=arm64 ;;
+	arm_cortex-a*) goarch=arm goarm=7 ;;
 	arm_arm1176*) goarch=arm goarm=6 ;;
-	arm_*) goarch=arm goarm=7 ;;
+	arm_*) goarch=arm goarm=5 ;;
 	mipsel_*) goarch=mipsle gomips=softfloat ;;
 	mips_*) goarch=mips gomips=softfloat ;;
+	riscv64_*) goarch=riscv64 ;;
+	loongarch64_*) goarch=loong64 ;;
 	*) echo "unsupported OpenWrt arch: $arch" >&2; exit 2 ;;
 esac
 
@@ -48,7 +55,7 @@ fi
 
 pkg=$work/pkg
 mkdir -p "$pkg/usr/bin" "$pkg/etc/init.d" "$pkg/etc/config"
-CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips \
+CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips GO386=$go386 \
 	go build -trimpath -ldflags='-s -w' -o "$pkg/usr/bin/rt2wg" ./cmd/rt2wg
 install -m 0755 deploy/openwrt/rt2wg.init "$pkg/etc/init.d/rt2wg"
 install -m 0644 deploy/openwrt/rt2wg.config "$pkg/etc/config/rt2wg"
@@ -77,7 +84,10 @@ exit 0
 EOF
 
 mkdir -p dist
-out=dist/rt2wg-$version-r1_$arch.apk
+# The file is named after the Go target (amd64, armv7, mipsle, ...);
+# the package's arch metadata stays as given.
+target=$goarch${goarm:+v$goarm}
+out=dist/rt2wg-$version-r1_$target.apk
 "$APK" mkpkg \
 	-I "name:rt2wg" \
 	-I "version:$version-r1" \

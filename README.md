@@ -23,6 +23,13 @@ systemctl daemon-reload
 systemctl enable --now rt2wg@wg0
 ```
 
+Or run `make`, which bundles the binary, the unit and an install script into
+`dist/rt2wg-<version>-linux-<arch>.tar.gz` (`make GOARCH=arm64`, or
+`GOARCH=arm GOARM=7`, to cross-compile). Unpack it on the target and run
+`./install.sh` as root in the unpacked directory: it does the same as above
+for one interface after asking for each variable below, and writes the
+answers to `/etc/default/rt2wg-<iface>`. Run it again to change them.
+
 One instance runs per WireGuard interface. Reload the config with
 `systemctl reload rt2wg@wg0` (SIGHUP).
 
@@ -47,11 +54,11 @@ Run `uname -m` on the Pi to check: `aarch64` means arm64, and `armv7l` or
 ### OpenWrt
 
 On OpenWrt 25.12 and later, build an apk package for the router's
-architecture, `DISTRIB_ARCH` in its `/etc/openwrt_release` (default
-`x86_64`; `apk --print-arch` shows something else):
+architecture: `DISTRIB_ARCH` in the router's `/etc/openwrt_release`
+(default `x86_64`):
 
 ```bash
-deploy/openwrt/build-apk.sh aarch64_cortex-a53
+deploy/openwrt/build-apk.sh arm_cortex-a7_neon-vfpv4
 ```
 
 This cross-compiles rt2wg and packs it with Alpine's static apk-tools
@@ -127,7 +134,7 @@ alone.
 
 ```bash
 go test ./...                          # unit tests, no privileges
-sudo go test -tags e2e ./e2e           # end-to-end, needs root and WireGuard (~35 s)
+go test -tags e2e ./e2e                # end-to-end, as root, needs WireGuard (~35 s)
 ```
 
 The end-to-end test runs in its own network namespace and leaves the host
