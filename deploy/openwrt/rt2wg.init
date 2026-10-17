@@ -2,12 +2,51 @@
 # rt2wg on OpenWrt: one procd instance per WireGuard interface listed in
 # /etc/config/rt2wg. Peers come from the interface's wireguard_<iface>
 # sections in /etc/config/network, converted to a wg-style file for rt2wg.
+#
+# The package keeps this script and its config across sysupgrade, but not
+# the binary: when it is missing, start reinstalls the package from the url
+# in /etc/config/rt2wg, and "upgrade" does so on demand.
 
 START=95
 USE_PROCD=1
 
+EXTRA_COMMANDS="upgrade"
+EXTRA_HELP="	upgrade	Download and install the package from the configured url"
+
 PROG=/usr/bin/rt2wg
 RUNDIR=/var/run/rt2wg
+
+# install_package downloads the package from the configured url and installs
+# it; apk's post-install script then enables and starts the service.
+install_package() {
+	local url tmp=/tmp/rt2wg.apk
+	url=$(uci_get rt2wg package url)
+	if [ -z "$url" ]; then
+		echo "rt2wg: no package url set in /etc/config/rt2wg" >&2
+		return 1
+	fi
+	uclient-fetch -q -O "$tmp" "$url" &&
+		apk add --allow-untrusted --repositories-file /dev/null "$tmp"
+	local ret=$?
+	rm -f "$tmp"
+	return $ret
+}
+
+# reinstall retries in the background, since at boot the network may not be
+# up yet and apk must not run under this script's procd transaction.
+reinstall() {
+	(
+		for i in 1 2 3; do
+			install_package 2>&1 | logger -t rt2wg && [ -x "$PROG" ] && exit 0
+			sleep 15
+		done
+		logger -t rt2wg "reinstall failed"
+	) </dev/null >/dev/null 2>&1 &
+}
+
+upgrade() {
+	install_package
+}
 
 collect_instance() {
 	local enabled
@@ -68,6 +107,10 @@ start_instance() {
 
 start_service() {
 	local s
+	if [ ! -x "$PROG" ]; then
+		reinstall
+		return 0
+	fi
 	load_instances
 	config_load network
 	for s in $INSTANCES; do

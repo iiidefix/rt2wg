@@ -54,11 +54,18 @@ if [ -z "${APK:-}" ]; then
 fi
 
 pkg=$work/pkg
-mkdir -p "$pkg/usr/bin" "$pkg/etc/init.d" "$pkg/etc/config"
+mkdir -p "$pkg/usr/bin" "$pkg/etc/init.d" "$pkg/etc/config" "$pkg/lib/upgrade/keep.d"
 CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips GO386=$go386 \
 	go build -trimpath -ldflags='-s -w' -o "$pkg/usr/bin/rt2wg" ./cmd/rt2wg
 install -m 0755 deploy/openwrt/rt2wg.init "$pkg/etc/init.d/rt2wg"
 install -m 0644 deploy/openwrt/rt2wg.config "$pkg/etc/config/rt2wg"
+# sysupgrade keeps these but not the binary, so on first boot the init
+# script reinstalls the package from the url in /etc/config/rt2wg.
+cat >"$pkg/lib/upgrade/keep.d/rt2wg" <<'EOF'
+/etc/config/rt2wg
+/etc/init.d/rt2wg
+/etc/rc.d/S95rt2wg
+EOF
 
 # Enable and start on install, as OpenWrt's own packages do; files under
 # /etc are kept by apk on upgrade, so local config edits survive.

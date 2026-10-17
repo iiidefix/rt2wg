@@ -72,6 +72,13 @@ apk add --allow-untrusted rt2wg-*.apk
 Installing enables and starts the service; `/etc/config/rt2wg` is kept
 across upgrades.
 
+To survive sysupgrade, set `url` in the `package` section of
+`/etc/config/rt2wg` to where the router can download its apk. sysupgrade
+keeps the config and the init script but drops the binary; on the first
+boot the init script reinstalls the package from `url` (three tries, 15 s
+apart, logged to `logread`). `/etc/init.d/rt2wg upgrade` installs the
+package from `url` on demand.
+
 Each `instance` section in `/etc/config/rt2wg` runs rt2wg for one interface
 (`interface`, default the section name), with optional `tables` and
 `log_level` instead of the environment variables. The netifd interface name
