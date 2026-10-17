@@ -33,6 +33,29 @@ answers to `/etc/default/rt2wg-<iface>`. Run it again to change them.
 One instance runs per WireGuard interface. Reload the config with
 `systemctl reload rt2wg@wg0` (SIGHUP).
 
+### Debian and Raspberry Pi OS
+
+Build a `.deb` for the target's architecture, as `dpkg --print-architecture`
+prints it there (default this machine's):
+
+```bash
+deploy/debian/build-deb.sh arm64
+```
+
+`armhf` is built for ARMv6, so it runs on every Pi under 32-bit Raspberry Pi
+OS. The package lands in `dist/`; install it and start one instance per
+interface:
+
+```bash
+apt install ./rt2wg_*.deb
+systemctl enable --now rt2wg@wg0
+```
+
+The package installs `/usr/bin/rt2wg` and the unit; put overrides in
+`/etc/default/rt2wg-<iface>` as below. Upgrades restart running instances.
+If you used `install.sh` before, remove `/usr/local/bin/rt2wg` and
+`/etc/systemd/system/rt2wg@.service`, which would override the package.
+
 ### Raspberry Pi
 
 Cross-compile on another machine and copy the binary to the Pi:
