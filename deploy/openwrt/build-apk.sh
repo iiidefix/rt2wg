@@ -87,7 +87,7 @@ mkdir -p dist
 # The file is named after the Go target (amd64, armv7, mipsle, ...);
 # the package's arch metadata stays as given.
 target=$goarch${goarm:+v$goarm}
-out=dist/rt2wg-$version-r1_$target.apk
+out=dist/rt2wg-${version}_$target.apk
 "$APK" mkpkg \
 	-I "name:rt2wg" \
 	-I "version:$version-r1" \
