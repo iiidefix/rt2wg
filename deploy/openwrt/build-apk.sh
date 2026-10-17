@@ -16,20 +16,35 @@ set -eu
 arch=${1:-x86_64}
 goarm=
 gomips=
+gomips64=
 go386=
+# The CPU and FPU in the arch name decide the Go target: hard float only
+# where OpenWrt builds for an FPU (vfp/neon on ARM, 24kf on MIPS, SSE2 from
+# the Pentium 4 on), since hard-float code dies with SIGILL without one.
+case "$arch" in
+	*_vfp* | *_neon* | *_24kf*) fpu=hardfloat ;;
+	*) fpu=softfloat ;;
+esac
 case "$arch" in
 	x86_64) goarch=amd64 ;;
+	i386_pentium4*) goarch=386 go386=sse2 ;;
 	i386_*) goarch=386 go386=softfloat ;;
 	aarch64_*) goarch=arm64 ;;
 	arm_cortex-a*) goarch=arm goarm=7 ;;
-	arm_arm1176*) goarch=arm goarm=6 ;;
+	arm_arm1176* | arm_mpcore*) goarch=arm goarm=6 ;;
 	arm_*) goarch=arm goarm=5 ;;
-	mipsel_*) goarch=mipsle gomips=softfloat ;;
-	mips_*) goarch=mips gomips=softfloat ;;
+	mipsel_*) goarch=mipsle gomips=$fpu ;;
+	mips_*) goarch=mips gomips=$fpu ;;
+	mips64el_*) goarch=mips64le gomips64=$fpu ;;
+	mips64_*) goarch=mips64 gomips64=$fpu ;;
 	riscv64_*) goarch=riscv64 ;;
 	loongarch64_*) goarch=loong64 ;;
 	*) echo "unsupported OpenWrt arch: $arch" >&2; exit 2 ;;
 esac
+# GOARM=5 is always soft float; for ARMv6 and ARMv7 Go assumes a VFP.
+if [ "$fpu" = softfloat ] && [ "$goarch" = arm ] && [ "$goarm" != 5 ]; then
+	goarm=$goarm,softfloat
+fi
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
@@ -55,7 +70,7 @@ fi
 
 pkg=$work/pkg
 mkdir -p "$pkg/usr/bin" "$pkg/etc/init.d" "$pkg/etc/config" "$pkg/lib/upgrade/keep.d"
-CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips GO386=$go386 \
+CGO_ENABLED=0 GOOS=linux GOARCH=$goarch GOARM=$goarm GOMIPS=$gomips GOMIPS64=$gomips64 GO386=$go386 \
 	go build -trimpath -ldflags='-s -w' -o "$pkg/usr/bin/rt2wg" ./cmd/rt2wg
 install -m 0755 deploy/openwrt/rt2wg.init "$pkg/etc/init.d/rt2wg"
 install -m 0644 deploy/openwrt/rt2wg.config "$pkg/etc/config/rt2wg"
@@ -91,10 +106,8 @@ exit 0
 EOF
 
 mkdir -p dist
-# The file is named after the Go target (amd64, armv7, mipsle, ...);
-# the package's arch metadata stays as given.
-target=$goarch${goarm:+v$goarm}
-out=dist/rt2wg-${version}_$target.apk
+# Named after the OpenWrt arch, like OpenWrt's own packages.
+out=dist/rt2wg-${version}_$arch.apk
 "$APK" mkpkg \
 	-I "name:rt2wg" \
 	-I "version:$version-r1" \

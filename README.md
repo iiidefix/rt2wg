@@ -102,6 +102,27 @@ boot the init script reinstalls the package from `url` (three tries, 15 s
 apart, logged to `logread`). `/etc/init.d/rt2wg upgrade` installs the
 package from `url` on demand.
 
+Set it with `uci`, pointing at the apk for this router's architecture on a
+server the router can reach over HTTP(S):
+
+```bash
+uci set rt2wg.package.url='https://example.com/rt2wg/rt2wg-latest_arm_cortex-a7_neon-vfpv4.apk'
+uci commit rt2wg
+```
+
+or edit `/etc/config/rt2wg` directly:
+
+```
+config package 'package'
+	option url 'https://example.com/rt2wg/rt2wg-latest_arm_cortex-a7_neon-vfpv4.apk'
+```
+
+The url is read each time it is needed, so no reload is required. To check
+it, run `/etc/init.d/rt2wg upgrade`, which downloads and reinstalls the
+package. `build-apk.sh` puts the version in the file name, so publish each
+release under the fixed name `rt2wg-latest_<arch>.apk` as well; the url then
+stays the same and the next sysupgrade installs the current release.
+
 Each `instance` section in `/etc/config/rt2wg` runs rt2wg for one interface
 (`interface`, default the section name), with optional `tables` and
 `log_level` instead of the environment variables. The netifd interface name
