@@ -70,6 +70,11 @@ func run() error {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 
-	daemon.New(iface, confPath, ts, cfg, wg, log).Run(ctx, hup)
+	d, err := daemon.New(iface, confPath, ts, cfg, wg, log)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	d.Run(ctx, hup)
 	return nil
 }

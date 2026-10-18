@@ -6,6 +6,21 @@ All notable changes to rt2wg. The format follows
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-18
+
+### Changed
+
+- Route dumps are filtered by the kernel (Linux 4.20+), so a pass no longer
+  parses every route in every table. With 100,000 unrelated routes, a dump
+  went from 40 MB and 400,000 allocations to 0.3 MB and 850, about 10 times
+  faster.
+- Computing AllowedIPs looks up gateway owners in an index instead of
+  scanning every peer for every route: about 6 times faster with 7 times less
+  memory for 64 peers and 4,096 routes.
+- An event pass starts no sooner than 100 ms after the previous pass, so a
+  burst of route changes or a churning monitored table cannot keep a core
+  busy. An isolated event is still handled at once.
+
 ## 0.2.4 - 2026-10-17
 
 ### Added

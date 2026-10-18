@@ -21,9 +21,15 @@ type Peer struct {
 	Static []netip.Prefix
 }
 
-// Config is the set of peers rt2wg manages, in file order.
+// Config is the set of peers rt2wg manages, in file order. It must not be
+// modified after Parse, which indexes the tunnel prefixes.
 type Config struct {
 	Peers []Peer
+
+	tunnel map[netip.Prefix]int // tunnel prefix -> index in Peers
+	// Distinct tunnel prefix lengths per family, longest first, so Owner
+	// needs one map lookup per length instead of a scan of every peer.
+	bits4, bits6 []int
 }
 
 // Load reads and parses the config file at path.
@@ -121,7 +127,31 @@ func Parse(r io.Reader) (*Config, error) {
 		}
 		cfg.Peers = append(cfg.Peers, Peer{Key: *s.key, Static: static})
 	}
+	cfg.index()
 	return cfg, nil
+}
+
+// index builds the tunnel prefix lookup. Parse has already rejected a static
+// prefix shared by two peers, so each tunnel prefix has one peer.
+func (c *Config) index() {
+	c.tunnel = map[netip.Prefix]int{}
+	for i, peer := range c.Peers {
+		for _, p := range peer.Static {
+			if IsDefault(p) {
+				continue
+			}
+			c.tunnel[p] = i
+			if p.Addr().Is4() {
+				c.bits4 = append(c.bits4, p.Bits())
+			} else {
+				c.bits6 = append(c.bits6, p.Bits())
+			}
+		}
+	}
+	for _, bits := range []*[]int{&c.bits4, &c.bits6} {
+		slices.SortFunc(*bits, func(a, b int) int { return b - a })
+		*bits = slices.Compact(*bits)
+	}
 }
 
 // parsePrefix parses CIDR notation or a bare IP (a host prefix).
@@ -171,28 +201,33 @@ func IsDefault(p netip.Prefix) bool { return p.Bits() == 0 }
 // Owner returns the peer whose tunnel prefix (a non-default static prefix)
 // contains gw most specifically.
 func (c *Config) Owner(gw netip.Addr) (wgtypes.Key, bool) {
+	if i, ok := c.OwnerIndex(gw); ok {
+		return c.Peers[i].Key, true
+	}
+	return wgtypes.Key{}, false
+}
+
+// OwnerIndex is Owner returning the owner's index in Peers.
+func (c *Config) OwnerIndex(gw netip.Addr) (int, bool) {
 	gw = gw.Unmap()
-	var owner wgtypes.Key
-	longest := -1
-	for _, peer := range c.Peers {
-		for _, p := range peer.Static {
-			if !IsDefault(p) && p.Bits() > longest && p.Contains(gw) {
-				owner, longest = peer.Key, p.Bits()
-			}
+	bits := c.bits6
+	if gw.Is4() {
+		bits = c.bits4
+	}
+	for _, b := range bits {
+		p, err := gw.Prefix(b)
+		if err != nil {
+			continue
+		}
+		if i, ok := c.tunnel[p]; ok {
+			return i, true
 		}
 	}
-	return owner, longest >= 0
+	return 0, false
 }
 
 // IsTunnelPrefix reports whether p is exactly some peer's tunnel prefix.
 func (c *Config) IsTunnelPrefix(p netip.Prefix) bool {
-	if IsDefault(p) {
-		return false
-	}
-	for _, peer := range c.Peers {
-		if slices.Contains(peer.Static, p) {
-			return true
-		}
-	}
-	return false
+	_, ok := c.tunnel[p]
+	return ok
 }

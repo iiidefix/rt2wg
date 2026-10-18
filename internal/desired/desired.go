@@ -4,8 +4,10 @@ package desired
 
 import (
 	"bytes"
+	"cmp"
 	"net"
 	"net/netip"
+	"slices"
 
 	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -16,27 +18,61 @@ import (
 
 // Desired returns the AllowedIPs every peer in the config should have: its
 // static prefixes plus the routed prefixes it owns. Each list is normalized.
+// Lists of peers that own no routed prefix share memory with cfg; treat the
+// result as read-only.
 func Desired(cfg *config.Config, ts *tables.Set, routes []netlink.Route) map[wgtypes.Key][]netip.Prefix {
+	cands := make([]candidateRoute, 0, len(routes))
+	for i := range routes {
+		if c, ok := candidate(cfg, ts, &routes[i]); ok {
+			cands = append(cands, c)
+		}
+	}
+	// Sorted by destination, the winning route comes first among those that
+	// share one (DES-4), and each peer's routed prefixes come out in order.
+	slices.SortFunc(cands, func(a, b candidateRoute) int {
+		if c := config.ComparePrefix(a.dst, b.dst); c != 0 {
+			return c
+		}
+		return a.compare(b, cfg)
+	})
+	winners := slices.CompactFunc(cands, func(a, b candidateRoute) bool { return a.dst == b.dst })
+
+	// Merge each peer's sorted static prefixes with its routed prefixes into
+	// a list allocated once at its final size.
+	count := make([]int, len(cfg.Peers))
+	for _, w := range winners {
+		count[w.owner]++
+	}
+	lists := make([][]netip.Prefix, len(cfg.Peers))
+	static := make([][]netip.Prefix, len(cfg.Peers)) // not yet merged
+	for i, p := range cfg.Peers {
+		static[i] = p.Static
+		if count[i] > 0 {
+			lists[i] = make([]netip.Prefix, 0, len(p.Static)+count[i])
+		}
+	}
+	for _, w := range winners {
+		l, st := lists[w.owner], static[w.owner]
+		for len(st) > 0 {
+			c := config.ComparePrefix(st[0], w.dst)
+			if c > 0 {
+				break
+			}
+			if c < 0 {
+				l = append(l, st[0])
+			}
+			st = st[1:]
+		}
+		lists[w.owner], static[w.owner] = append(l, w.dst), st
+	}
 	out := make(map[wgtypes.Key][]netip.Prefix, len(cfg.Peers))
-	for _, p := range cfg.Peers {
-		out[p.Key] = append([]netip.Prefix(nil), p.Static...)
-	}
-	// Pick the winning route per destination (DES-4).
-	winners := map[netip.Prefix]candidateRoute{}
-	for _, r := range routes {
-		c, ok := candidate(cfg, ts, r)
-		if !ok {
-			continue
+	for i, p := range cfg.Peers {
+		if count[i] == 0 {
+			// Clipped so appending to the result cannot write into cfg.
+			out[p.Key] = slices.Clip(p.Static)
+		} else {
+			out[p.Key] = append(lists[i], static[i]...)
 		}
-		if w, seen := winners[c.dst]; !seen || c.beats(w) {
-			winners[c.dst] = c
-		}
-	}
-	for dst, w := range winners {
-		out[w.owner] = append(out[w.owner], dst)
-	}
-	for k, ps := range out {
-		out[k] = config.Normalize(ps)
 	}
 	return out
 }
@@ -68,43 +104,47 @@ func PrefixFromIPNet(n *net.IPNet) (netip.Prefix, bool) {
 // candidateRoute is a route that passed every DES-2 filter, reduced to what
 // decides its routed prefix's owner.
 type candidateRoute struct {
-	dst          netip.Prefix
-	owner        wgtypes.Key
-	rank, metric int
+	dst    netip.Prefix
+	owner  int32 // index in cfg.Peers
+	rank   int32
+	metric int
 }
 
 // candidate reports whether r is a candidate route (DES-2). The output
-// interface is filtered when listing.
-func candidate(cfg *config.Config, ts *tables.Set, r netlink.Route) (candidateRoute, bool) {
-	dst, ok := PrefixFromIPNet(r.Dst)
-	if !ok || config.IsDefault(dst) {
+// interface is filtered when listing. The cheapest checks go first.
+func candidate(cfg *config.Config, ts *tables.Set, r *netlink.Route) (candidateRoute, bool) {
+	if r.Gw == nil || len(r.MultiPath) > 0 {
 		return candidateRoute{}, false
 	}
 	rank, ok := ts.Rank(r.Table)
 	if !ok {
 		return candidateRoute{}, false
 	}
+	dst, ok := PrefixFromIPNet(r.Dst)
+	if !ok || config.IsDefault(dst) || cfg.IsTunnelPrefix(dst) {
+		return candidateRoute{}, false
+	}
 	gw, ok := netip.AddrFromSlice(r.Gw)
-	if !ok || len(r.MultiPath) > 0 {
+	if !ok {
 		return candidateRoute{}, false
 	}
-	owner, ok := cfg.Owner(gw.Unmap())
-	if !ok || cfg.IsTunnelPrefix(dst) {
+	owner, ok := cfg.OwnerIndex(gw)
+	if !ok {
 		return candidateRoute{}, false
 	}
-	return candidateRoute{dst, owner, rank, r.Priority}, true
+	return candidateRoute{dst, int32(owner), int32(rank), r.Priority}, true
 }
 
-// beats reports whether c is preferred over o as the winning route: lower
+// compare orders c before o if c is preferred as the winning route: lower
 // table rank, then lower metric, then the byte-wise lower public key.
-func (c candidateRoute) beats(o candidateRoute) bool {
+func (c candidateRoute) compare(o candidateRoute, cfg *config.Config) int {
 	if c.rank != o.rank {
-		return c.rank < o.rank
+		return int(c.rank - o.rank)
 	}
 	if c.metric != o.metric {
-		return c.metric < o.metric
+		return cmp.Compare(c.metric, o.metric)
 	}
-	return bytes.Compare(c.owner[:], o.owner[:]) < 0
+	return bytes.Compare(cfg.Peers[c.owner].Key[:], cfg.Peers[o.owner].Key[:])
 }
 
 // IPNetFromPrefix converts a prefix to the net.IPNet form wgctrl expects,

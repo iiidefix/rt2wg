@@ -27,9 +27,14 @@ import (
 const (
 	tickInterval     = 30 * time.Second
 	resubscribeDelay = 2 * time.Second
-	eventBuffer      = 100
-	receiveBuffer    = 4 << 20
-	dumpAttempts     = 3
+	// eventGap is the least time between the end of a pass and the start of
+	// an event pass, so a burst of route changes (a BGP session coming up, a
+	// flapping full table in a monitored table) costs a few passes a second
+	// instead of one per event. An isolated event still runs a pass at once.
+	eventGap      = 100 * time.Millisecond
+	eventBuffer   = 100
+	receiveBuffer = 4 << 20
+	dumpAttempts  = 3
 )
 
 // Daemon keeps the AllowedIPs of one WireGuard interface's managed peers in
@@ -39,6 +44,7 @@ type Daemon struct {
 	confPath string
 	tables   *tables.Set
 	wg       *wgctrl.Client
+	nl       *netlink.Handle // used by the run loop only
 	log      *slog.Logger
 
 	cfg *config.Config // owned by the run loop
@@ -50,17 +56,31 @@ type Daemon struct {
 }
 
 // New returns a Daemon for iface with an already loaded config.
-func New(iface, confPath string, ts *tables.Set, cfg *config.Config, wg *wgctrl.Client, log *slog.Logger) *Daemon {
+func New(iface, confPath string, ts *tables.Set, cfg *config.Config, wg *wgctrl.Client, log *slog.Logger) (*Daemon, error) {
+	h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return nil, fmt.Errorf("opening netlink: %w", err)
+	}
+	// With strict checking the kernel applies the dump filter itself and only
+	// sends routes on the WireGuard interface, instead of every route in every
+	// table (Linux 4.20+). Older kernels keep filtering in the library.
+	if err := h.SetStrictCheck(true); err != nil {
+		log.Debug("netlink strict checking unavailable, filtering routes in userspace", "err", err)
+	}
 	return &Daemon{
 		iface:    iface,
 		confPath: confPath,
 		tables:   ts,
 		cfg:      cfg,
 		wg:       wg,
+		nl:       h,
 		log:      log,
 		trigger:  make(chan struct{}, 1),
-	}
+	}, nil
 }
+
+// Close releases the netlink socket.
+func (d *Daemon) Close() { d.nl.Close() }
 
 // Run does the startup pass, starts the event watcher and runs passes until
 // ctx is cancelled. hup delivers SIGHUP.
@@ -68,7 +88,14 @@ func (d *Daemon) Run(ctx context.Context, hup <-chan os.Signal) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
-	d.pass("startup")
+	var last time.Time        // when the last pass ended
+	var held <-chan time.Time // fires when a held-back event pass may run
+	run := func(reason string) {
+		d.pass(reason)
+		last = time.Now()
+	}
+
+	run("startup")
 	go d.watch(ctx)
 
 	for {
@@ -77,12 +104,22 @@ func (d *Daemon) Run(ctx context.Context, hup <-chan os.Signal) {
 			d.log.Info("shutting down")
 			return
 		case <-d.trigger:
-			d.pass("event")
+			if held != nil {
+				continue // merges with the held-back pass
+			}
+			if wait := eventGap - time.Since(last); wait > 0 {
+				held = time.After(wait)
+				continue
+			}
+			run("event")
+		case <-held:
+			held = nil
+			run("event")
 		case <-ticker.C:
-			d.pass("ticker")
+			run("ticker")
 		case <-hup:
 			d.reload()
-			d.pass("sighup")
+			run("sighup")
 		}
 	}
 }
@@ -107,7 +144,7 @@ func (d *Daemon) requestPass() {
 
 // pass is one reconcile run (REC-1..13).
 func (d *Daemon) pass(reason string) {
-	link, err := netlink.LinkByName(d.iface)
+	link, err := d.nl.LinkByName(d.iface)
 	if err != nil {
 		d.log.Error("interface lookup failed", "err", err)
 		return
@@ -117,7 +154,7 @@ func (d *Daemon) pass(reason string) {
 		d.log.Info("interface index tracked", "index", idx)
 	}
 
-	routes, err := listRoutes(idx)
+	routes, err := listRoutes(d.nl, idx)
 	if err != nil {
 		d.log.Error("route dump failed", "err", err)
 		return
@@ -168,12 +205,12 @@ func (d *Daemon) pass(reason string) {
 }
 
 // listRoutes lists routes on the interface from all tables (NL-3, NL-4).
-func listRoutes(idx int) ([]netlink.Route, error) {
+func listRoutes(h *netlink.Handle, idx int) ([]netlink.Route, error) {
 	filter := &netlink.Route{LinkIndex: idx, Table: unix.RT_TABLE_UNSPEC}
 	var err error
 	for range dumpAttempts {
 		var routes []netlink.Route
-		routes, err = netlink.RouteListFiltered(netlink.FAMILY_ALL, filter,
+		routes, err = h.RouteListFiltered(netlink.FAMILY_ALL, filter,
 			netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
 		if !errors.Is(err, netlink.ErrDumpInterrupted) {
 			return routes, err
@@ -225,8 +262,11 @@ func (d *Daemon) subscribeOnce(ctx context.Context) {
 			if !desired.Relevant(d.tables, u) {
 				continue
 			}
-			d.log.Debug("route event", "type", eventType(u.Type), "table", u.Table,
-				"dst", u.Dst, "gw", u.Gw)
+			// Checked first so the arguments are not built for every event.
+			if d.log.Enabled(ctx, slog.LevelDebug) {
+				d.log.Debug("route event", "type", eventType(u.Type), "table", u.Table,
+					"dst", u.Dst, "gw", u.Gw)
+			}
 			d.requestPass()
 		}
 	}
@@ -261,18 +301,21 @@ func ipNets(ps []netip.Prefix) []net.IPNet {
 }
 
 // diff counts prefixes in want but not cur (added) and in cur but not want.
+// Both lists are normalized, so one merge walk finds them.
 func diff(cur, want []netip.Prefix) (added, removed int) {
-	for _, p := range want {
-		if !slices.Contains(cur, p) {
-			added++
-		}
-	}
-	for _, p := range cur {
-		if !slices.Contains(want, p) {
+	for len(cur) > 0 && len(want) > 0 {
+		switch c := config.ComparePrefix(cur[0], want[0]); {
+		case c < 0:
 			removed++
+			cur = cur[1:]
+		case c > 0:
+			added++
+			want = want[1:]
+		default:
+			cur, want = cur[1:], want[1:]
 		}
 	}
-	return added, removed
+	return added + len(want), removed + len(cur)
 }
 
 // short identifies a peer in logs by the first 8 characters of its key.
